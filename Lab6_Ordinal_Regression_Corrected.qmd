@@ -1,0 +1,653 @@
+---
+title: "Ordinal Logistic Regression with the Big Five"
+subtitle: "Does Neuroticism predict responses to 'Do things in a half-way manner'?"
+format:
+  html:
+    toc: true
+    code-fold: false
+    embed-resources: true
+    html-math-method: katex
+execute:
+  echo: true
+  warning: false
+  message: false
+  fig-width: 8
+  fig-height: 4.4
+---
+
+```{r}
+#| label: setup
+#| include: false
+
+library(tidyverse)
+library(psych)
+library(ordinal)
+library(readxl)
+library(ggeffects)
+library(broom)
+library(gt)
+```
+
+## Question and predictions
+
+The BFI data contain 25 personality items from approximately 2,800 people, with five items measuring each of the Big Five personality traits. Each item is answered on a 6-point scale ranging from *Very inaccurate* to *Very accurate*.
+
+The selected outcome is **C4, "Do things in a half-way manner,"** an item measuring Conscientiousness. The predictor is the **Neuroticism subscale score**, calculated as the mean of N1 to N5.
+
+I predict that higher Neuroticism scores will be associated with higher responses to C4. Individuals with higher Neuroticism may experience greater emotional instability, which could be associated with difficulty maintaining consistent task completion. Because C4 is reverse-keyed in the Conscientiousness scale, higher responses indicate lower Conscientiousness.
+
+## Load and inspect the data
+
+```{r}
+bfi_data <- read_excel("bfi.xlsx")
+
+# Convert the 25 BFI item columns to integers.
+bfi_data[, 2:26] <- lapply(bfi_data[, 2:26], as.integer)
+
+str(bfi_data)
+head(bfi_data)
+```
+
+## Data preparation
+
+### Define response labels
+
+```{r}
+labels <- c(
+  "Very inaccurate",
+  "Moderately inaccurate",
+  "Slightly inaccurate",
+  "Slightly accurate",
+  "Moderately accurate",
+  "Very accurate"
+)
+```
+
+### Score the Big Five subscales
+
+The negatively keyed items are reverse-scored by `scoreItems()` when the minus sign is included in the key.
+
+```{r}
+keys <- list(
+  Agreeableness = c("-A1", "A2", "A3", "A4", "A5"),
+  Conscientiousness = c("C1", "C2", "C3", "-C4", "-C5"),
+  Extraversion = c("-E1", "-E2", "E3", "E4", "E5"),
+  Neuroticism = c("N1", "N2", "N3", "N4", "N5"),
+  Openness = c("O1", "-O2", "O3", "O4", "-O5")
+)
+
+scores_obj <- scoreItems(
+  keys,
+  bfi_data,
+  totals = FALSE,
+  min = 1,
+  max = 6
+)
+
+scores <- as_tibble(scores_obj$scores)
+head(scores)
+```
+
+### Create the analysis data
+
+This step attaches the calculated subscale scores to the original item data, creates the ordered C4 outcome, and centres Neuroticism. All analyses below use this same complete-case analysis data frame.
+
+```{r}
+#| label: prepare-analysis-data
+
+data <- bind_cols(bfi_data, scores) |>
+  mutate(C4 = ordered(C4, levels = 1:6, labels = labels)) |>
+  drop_na(C4, Neuroticism) |>
+  mutate(
+    neuroticism_bar = mean(Neuroticism),
+    neuroticism_c = Neuroticism - neuroticism_bar
+  )
+
+# Save the mean used for centring as a separate scalar for inline reporting.
+neuroticism_bar <- mean(data$Neuroticism)
+
+# Check that the variables used in the model exist.
+head(data[, c("C4", "Neuroticism", "neuroticism_c")])
+summary(data$Neuroticism)
+```
+
+## 1. Look at the outcomes first
+
+### The ordered outcome
+
+```{r}
+#| label: c4-counts
+
+c4_counts <- data |>
+  count(C4, .drop = FALSE) |>
+  mutate(p = n / sum(n))
+
+c4_counts
+```
+
+The smallest category contains `r min(c4_counts$n)` responses (`r round(100 * min(c4_counts$p), 2)`% of the analysed sample). This category is relatively less frequent than the others, but it is not empty. All six response categories are retained; none are collapsed.
+
+```{r}
+#| label: c4-bar-graph
+
+plot_c4 <- ggplot(c4_counts, aes(x = C4, y = n, fill = C4)) +
+  geom_col(width = 0.7) +
+  scale_x_discrete(labels = scales::label_wrap(12), drop = FALSE) +
+  labs(
+    title = "Six ordered categories: 'Do things in a half-way manner'",
+    x = NULL,
+    y = "People"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+plot_c4
+```
+
+### How the predictor relates to the responses
+
+We can visualize how each person's Neuroticism score relates to their C4 response. Because many people have the same Neuroticism score and C4 response, `geom_jitter()` spreads out overlapping points.
+
+```{r}
+#| label: jitter-plot
+
+plot_jitter <- ggplot(
+  data,
+  aes(x = Neuroticism, y = as.numeric(C4), colour = C4)
+) +
+  geom_jitter(width = 0.05, height = 0.15, alpha = 0.25, size = 1.4) +
+  scale_y_continuous(breaks = 1:6, labels = labels) +
+  labs(
+    title = "Neuroticism and responses to 'Do things in a half-way manner'",
+    x = "Neuroticism (subscale mean, 1-6)",
+    y = NULL
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+plot_jitter
+```
+
+The outcome takes only six ordered values. An ordinal logistic regression model predicts the probability of each of those six response categories rather than treating the outcome as a continuous decimal score.
+
+### An unordered outcome
+
+Each person's **dominant trait** (their highest of the five subscale scores) is a set of categories with no built-in order. Being highest on Openness is not "more" than being highest on Agreeableness. An outcome like this requires a baseline-category (multinomial) model, such as `nnet::multinom()`, rather than `clm()`.
+
+```{r}
+#| label: dominant-trait
+
+trait_scores <- data |>
+  select(
+    Agreeableness,
+    Conscientiousness,
+    Extraversion,
+    Neuroticism,
+    Openness
+  )
+
+data$highest <- factor(
+  names(trait_scores)[
+    max.col(as.matrix(trait_scores), ties.method = "first")
+  ],
+  levels = names(trait_scores)
+)
+
+ordered_dat <- data |>
+  count(highest) |>
+  mutate(highest = fct_reorder(highest, n))
+
+unordered_plot <- ggplot(ordered_dat, aes(highest, n)) +
+  geom_col(width = 0.65, fill = "maroon") +
+  coord_flip() +
+  labs(
+    title = "Dominant trait: five categories with no order",
+    x = NULL,
+    y = "People"
+  ) +
+  theme_minimal()
+
+unordered_plot
+```
+
+## 2. Cumulative probabilities
+
+A cumulative probability is the probability of responding with a specific response category (*j*) or lower. With six ordered categories, there are five non-trivial cumulative probabilities to model. The cumulative probability of the sixth category is 100%, so it does not provide a finite cumulative odds or log-odds value.
+
+```{r}
+#| label: cumulative-probability-table
+
+obs_tab <- data |>
+  count(C4, .drop = FALSE) |>
+  mutate(
+    Probability = n / sum(n),
+    CumulativeProbability = cumsum(Probability),
+    CumulativeOdds = if_else(
+      CumulativeProbability < 1,
+      CumulativeProbability / (1 - CumulativeProbability),
+      NA_real_
+    ),
+    Cumulative_Logodds = if_else(
+      CumulativeProbability < 1,
+      qlogis(CumulativeProbability),
+      NA_real_
+    )
+  )
+
+obs_tab |>
+  gt() |>
+  cols_label(
+    C4 = "Category in C4 (j)",
+    n = "n",
+    Probability = "P(Y = j)",
+    CumulativeProbability = "P(Y ≤ j)",
+    CumulativeOdds = "Odds of ≤ j",
+    Cumulative_Logodds = "Log-odds of ≤ j"
+  ) |>
+  fmt_number(columns = c(Probability, CumulativeProbability), decimals = 3) |>
+  fmt_number(columns = c(CumulativeOdds, Cumulative_Logodds), decimals = 2) |>
+  sub_missing(missing_text = "—")
+```
+
+Each cumulative probability splits the response scale into two groups: responses at or below category *j* and responses above it. The ordinal logistic regression model estimates all five cumulative comparisons simultaneously while accounting for the natural ordering of the six response categories.
+
+## 3. The model with a centred predictor
+
+We centred the Neuroticism subscale score so that the thresholds describe a person with average Neuroticism (`r round(neuroticism_bar, 2)`), rather than a person with a score of 0 on the original 1–6 scale. Centring changes the thresholds but does not change the slope.
+
+In the `clm()` cumulative-logit parameterization, the cumulative logit is expressed as a threshold minus the linear predictor. Therefore, a **positive** Neuroticism coefficient indicates greater odds of responding **above** a given threshold; a negative coefficient indicates lower odds of responding above a threshold.
+
+```{r}
+#| label: fit-models
+
+# Null model: thresholds only, no predictors.
+null <- clm(C4 ~ 1, data = data, link = "logit")
+
+# One-predictor proportional-odds model.
+one_pred <- clm(C4 ~ neuroticism_c, data = data, link = "logit")
+
+summary(one_pred)
+```
+
+```{r}
+#| label: save-model-elements
+
+# The slope for Neuroticism, pulled out by name.
+b <- coef(one_pred)[["neuroticism_c"]]
+
+# The five thresholds.
+th <- coef(one_pred)[1:5]
+
+# Cumulative probabilities for a person with average Neuroticism
+# (neuroticism_c = 0).
+cum_avg <- plogis(th)
+
+# Probability of each response category.
+cat_p <- diff(c(0, cum_avg, 1))
+
+# Odds ratio and confidence interval for the location (slope) term.
+or_tab <- broom::tidy(one_pred, conf.int = TRUE, exponentiate = TRUE) |>
+  filter(coef.type == "location")
+
+b
+or_tab
+```
+
+The estimated slope is β = `r round(b, 3)`. This coefficient represents the association between Neuroticism and the cumulative log-odds of responding at or below each threshold, with the sign interpreted according to the cumulative-logit parameterization described above.
+
+To put the slope in context, the following table shows the distances between adjacent thresholds. A one-point increase in Neuroticism changes the cumulative log-odds by `r round(abs(b), 3)` units. This is compared with the distances between the middle thresholds; the slope is therefore not a change of one full response category.
+
+### Comparing the slope with threshold distances
+
+```{r}
+#| label: threshold-distances
+
+threshold_distances <- tibble(
+  Threshold_interval = paste(labels[1:4], "to", labels[2:5]),
+  Distance = diff(as.numeric(th))
+)
+
+threshold_distances |>
+  gt() |>
+  fmt_number(columns = Distance, decimals = 3)
+```
+
+### What the centred thresholds mean
+
+```{r}
+#| label: centred-threshold-table
+
+tibble(
+  Category = labels,
+  theta = c(as.numeric(th), NA_real_),
+  cum = c(plogis(as.numeric(th)), 1),
+  cat_p = cat_p
+) |>
+  gt() |>
+  cols_label(
+    theta = "Threshold above category",
+    cum = "P(Y ≤ j)",
+    cat_p = "P(Y = j)"
+  ) |>
+  fmt_number(columns = theta, decimals = 2) |>
+  fmt_number(columns = c(cum, cat_p), decimals = 2) |>
+  sub_missing(missing_text = "—")
+```
+
+Apply `plogis()` to each threshold to obtain the cumulative probabilities, then calculate the differences between consecutive cumulative probabilities to obtain the probability of each individual response category. For a person with average Neuroticism (centred Neuroticism = 0), the most likely response category is *`r labels[which.max(cat_p)]`* (`r round(max(cat_p), 2)`). The probability of endorsing the item at or above "Slightly accurate" for a person with average Neuroticism is `r round(sum(cat_p[4:6]), 3)`.
+
+## 4. Null model versus one-predictor model
+
+The null model has thresholds only. With no predictors, its thresholds reproduce the observed cumulative log-odds from Section 2.
+
+```{r}
+#| label: compare-null-thresholds
+
+ tibble(
+  Threshold = 1:5,
+  Null_model = as.numeric(coef(null)[1:5]),
+  Observed_cumulative_logodds = obs_tab$Cumulative_Logodds[1:5]
+) |>
+  gt() |>
+  fmt_number(columns = c(Null_model, Observed_cumulative_logodds), decimals = 3)
+```
+
+This is a useful sanity check: it shows that the thresholds from the null model correspond to the observed cumulative log-odds. Once Neuroticism is added as a predictor, the thresholds become conditional on the predictor value. Because the predictor is centred, these thresholds describe a person with average Neuroticism rather than the overall sample proportions.
+
+Now we compare the two nested models with a likelihood ratio test (LRT) and AIC.
+
+```{r}
+#| label: likelihood-ratio-test
+
+lrt <- anova(null, one_pred)
+lrt
+```
+
+Adding Neuroticism as a predictor significantly improves model fit compared with the null model when the likelihood ratio test is statistically significant. The AIC comparison provides a second measure of relative model fit; the model with the lower AIC is preferred.
+
+```{r}
+#| label: aic-comparison
+
+aic_tab <- tibble(
+  Model = c("Null", "Neuroticism"),
+  Parameters = c(length(coef(null)), length(coef(one_pred))),
+  logLik = c(as.numeric(logLik(null)), as.numeric(logLik(one_pred))),
+  AIC = c(AIC(null), AIC(one_pred))
+) |>
+  mutate(`ΔAIC` = AIC - min(AIC))
+
+aic_tab |>
+  gt() |>
+  fmt_number(columns = c(logLik, AIC, `ΔAIC`), decimals = 1)
+```
+
+AIC provides another way to compare the two models. A lower AIC indicates a better balance between model fit and complexity. The difference in AIC (ΔAIC) helps assess whether the model including Neuroticism is preferred over the null model.
+
+### 4b. Comparing and interpreting the chosen model
+
+```{r}
+#| label: lrt-aic-inline-values
+
+lr_stat <- lrt$LR.stat[2]
+lr_df <- lrt$df[2]
+lr_p <- lrt$`Pr(>Chisq)`[2]
+delta_aic <- AIC(one_pred) - AIC(null)
+```
+
+The slope, β = `r round(b, 3)`, is on the latent logit scale. A one-point increase in Neuroticism changes the cumulative log-odds of responding at or below each C4 threshold by `r round(-b, 3)`, under the model's shared-slope assumption. Because C4 is reverse-keyed in the Conscientiousness scale, higher responses indicate lower Conscientiousness.
+
+## 5. Checking proportional odds
+
+The ordinal logistic regression model assumes a shared slope for Neuroticism across all five cumulative thresholds. In other words, the effect of Neuroticism is assumed to be the same across the different divisions of the six ordered C4 response categories.
+
+The `nominal_test()` function evaluates this assumption by fitting a model that allows Neuroticism to have a separate effect across thresholds and comparing it with the proportional-odds model using a likelihood ratio test. If the separate effects do not significantly improve model fit, the proportional-odds assumption is supported.
+
+```{r}
+#| label: nominal-test
+
+nt <- nominal_test(one_pred)
+nt
+```
+
+```{r}
+#| label: nominal-test-inline-values
+
+nt_lrt <- as.numeric(nt["neuroticism_c", "LRT"])
+nt_df <- as.numeric(nt["neuroticism_c", "Df"])
+nt_p <- as.numeric(nt["neuroticism_c", "Pr(>Chi)"])
+```
+
+The proportional-odds test was `r ifelse(nt_p < .05, "statistically significant", "not statistically significant")`. A significant result indicates evidence that the Neuroticism effect is not constant across all five thresholds. I therefore fit the nominal-effects model specified in the assignment and compare it with the proportional-odds model below.
+
+### Fit and compare the nominal-effects model
+
+The assignment specifies a model with threshold-specific effects for Neuroticism and no shared location slope. This is fitted using `C4 ~ 1` with `nominal = ~ neuroticism_c`.
+
+```{r}
+#| label: nominal-effects-model
+
+m_nom <- clm(
+  C4 ~ 1,
+  nominal = ~ neuroticism_c,
+  data = data,
+  link = "logit"
+)
+
+summary(m_nom)
+
+# Compare the proportional-odds model with the nominal-effects model.
+nominal_model_comparison <- anova(one_pred, m_nom)
+nominal_model_comparison
+```
+
+The nominal-effects model allows the Neuroticism association to differ across the five cumulative thresholds. The likelihood-ratio comparison evaluates whether this added flexibility improves fit relative to the proportional-odds model.
+
+```{r}
+#| label: threshold-specific-odds-ratios
+
+nominal_coef <- coef(m_nom)
+nominal_terms <- grep("neuroticism_c$", names(nominal_coef), value = TRUE)
+nominal_beta <- nominal_coef[nominal_terms]
+nominal_se <- sqrt(diag(vcov(m_nom))[nominal_terms])
+
+threshold_or <- tibble(
+  Threshold = sub("\\.neuroticism_c$", "", nominal_terms),
+  beta_nominal = unname(nominal_beta),
+  SE = unname(nominal_se),
+  OR = exp(-unname(nominal_beta)),
+  CI_low = exp(-unname(nominal_beta) - 1.96 * unname(nominal_se)),
+  CI_high = exp(-unname(nominal_beta) + 1.96 * unname(nominal_se)),
+  p_value = 2 * pnorm(abs(unname(nominal_beta) / unname(nominal_se)), lower.tail = FALSE)
+) |>
+  mutate(p_display = if_else(p_value < .001, "< .001", format.pval(p_value, digits = 3)))
+
+threshold_or |>
+  select(Threshold, beta_nominal, SE, OR, CI_low, CI_high, p_display) |>
+  gt() |>
+  cols_label(
+    Threshold = "Cumulative threshold",
+    beta_nominal = "Nominal beta",
+    SE = "SE",
+    OR = "Threshold-specific OR",
+    CI_low = "95% CI low",
+    CI_high = "95% CI high",
+    p_display = "p"
+  ) |>
+  fmt_number(columns = c(beta_nominal, SE, OR, CI_low, CI_high), decimals = 3)
+```
+
+The nominal-effect coefficients have the opposite sign from the location coefficient in the proportional-odds model, so the sign is reversed when calculating the threshold-specific odds ratios. Odds ratios above 1 indicate higher odds of selecting a response above that threshold as Neuroticism increases. Differences among these five odds ratios show how the association varies across the response scale.
+
+## 6. Interpreting the coefficient by changing odds ratios to probabilities
+
+```{r}
+#| label: odds-ratio-table
+
+or_tab <- broom::tidy(one_pred, conf.int = TRUE, exponentiate = TRUE) |>
+  filter(coef.type == "location")
+
+or_tab
+```
+
+**Neuroticism:** OR = `r round(or_tab$estimate, 3)`, 95% CI [`r round(or_tab$conf.low, 3)`, `r round(or_tab$conf.high, 3)`], *p* = `r format.pval(or_tab$p.value, digits = 3)`. Each one-point increase in Neuroticism multiplies the odds of responding **above any threshold** (for example, "Slightly accurate or higher" versus lower responses) by `r round(or_tab$estimate, 3)`, assuming proportional odds.
+
+An odds ratio is not a change in the number of categories, and it is not a ratio of probabilities. The table below translates the model into probabilities. It uses the threshold between *Slightly inaccurate* and *Slightly accurate*, so it shows the probability of endorsing the C4 item at or above "Slightly accurate."
+
+```{r}
+#| label: convert-or-to-probabilities
+
+# Threshold between "Slightly inaccurate" and "Slightly accurate".
+# This is the third threshold: th[3].
+
+neuroticism_values <- c(3, 4, 5, 6)
+
+# Under clm's cumulative-logit parameterization:
+# logit[P(Y <= j)] = threshold_j - beta * centred_predictor.
+logodds_lower <- as.numeric(th[3]) - b * (neuroticism_values - neuroticism_bar)
+
+# Probability of responding above the third threshold.
+prob <- 1 - plogis(logodds_lower)
+
+# Odds of responding above the third threshold.
+odds <- prob / (1 - prob)
+
+prob_tab <- tibble(
+  Neuroticism = neuroticism_values,
+  Prob = prob,
+  Odds = odds
+)
+
+prob_tab |>
+  gt() |>
+  cols_label(Prob = "P(Slightly accurate or higher)") |>
+  fmt_number(columns = c(Prob, Odds), decimals = 3)
+```
+
+Each one-point increase in Neuroticism multiplies the odds of responding above the third C4 threshold by `r round(prob_tab$Odds[2] / prob_tab$Odds[1], 3)`, which corresponds to the model's odds ratio. The **probability**, however, changes from `r round(prob_tab$Prob[1], 3)` to `r round(prob_tab$Prob[2], 3)` between Neuroticism scores of 3 and 4, but from `r round(prob_tab$Prob[3], 3)` to `r round(prob_tab$Prob[4], 3)` between scores of 5 and 6. A constant odds ratio can therefore correspond to different changes in probability depending on the starting value.
+
+## 7. Predicted probabilities and odds ratios
+
+### 7a. Predicted category probabilities
+
+```{r}
+#| label: predicted-probabilities
+
+# Predict across the observed range of centred Neuroticism.
+pred <- ggpredict(one_pred, terms = "neuroticism_c [all]")
+
+pred_df <- as.data.frame(pred) |>
+  mutate(
+    response.level = factor(response.level, levels = labels),
+    Neuroticism = x + neuroticism_bar
+  )
+
+pred_df |>
+  ggplot(aes(Neuroticism, predicted, fill = response.level)) +
+  geom_area(position = "stack") +
+  scale_x_continuous(limits = c(1, 6), breaks = 1:6) +
+  scale_y_continuous(labels = scales::percent) +
+  scale_fill_discrete(drop = FALSE) +
+  guides(fill = guide_legend(nrow = 2)) +
+  labs(
+    title = "Predicted probability of each response to C4",
+    subtitle = "'Do things in a half-way manner'",
+    x = "Neuroticism (subscale mean)",
+    y = "Predicted probability",
+    fill = "C4 response"
+  ) +
+  theme_minimal()
+```
+
+The stacked area plot shows how the predicted probabilities of the six C4 response categories change across the observed range of Neuroticism. At each Neuroticism value, the probabilities of all six response categories sum to 1.
+
+### 7b. Coefficient plot of cumulative odds ratio
+
+The plot shows the shared proportional-odds odds ratio for Neuroticism and its 95% confidence interval. The vertical reference line at 1 represents no association.
+
+```{r}
+#| label: odds-ratio-plot
+
+or_plot_data <- or_tab |>
+  transmute(
+    Predictor = "Neuroticism (shared proportional-odds effect)",
+    OR = estimate,
+    low = conf.low,
+    high = conf.high
+  )
+
+ggplot(or_plot_data, aes(x = OR, y = Predictor)) +
+  geom_vline(xintercept = 1, linetype = "dashed", colour = "grey50") +
+  geom_pointrange(aes(xmin = low, xmax = high)) +
+  scale_x_log10() +
+  labs(
+    title = "Cumulative odds ratio for Neuroticism",
+    x = "Odds ratio (responding above the threshold)",
+    y = NULL
+  ) +
+  theme_minimal()
+```
+
+An odds ratio above 1 indicates higher odds of responding above a given threshold as Neuroticism increases; an odds ratio below 1 indicates lower odds. The proportional-odds model assumes this odds ratio is shared across all five thresholds.
+
+## 8. Results paragraph
+
+We fitted a cumulative logit ordinal regression model predicting responses to "Do things in a half-way manner" from mean-centred Neuroticism (*N* = `r format(nrow(data), big.mark = ",")`). The model including Neuroticism `r ifelse(lr_p < .05, "significantly improved", "did not significantly improve")` fit over the null model, χ²(`r lr_df`) = `r round(lr_stat, 2)`, *p* `r ifelse(lr_p < .001, "< .001", paste0("= ", format.pval(lr_p, digits = 3)))`, with ΔAIC = `r round(delta_aic, 2)`. The estimated cumulative odds ratio was `r round(or_tab$estimate, 3)`, 95% CI [`r round(or_tab$conf.low, 3)`, `r round(or_tab$conf.high, 3)`], *p* `r ifelse(or_tab$p.value < .001, "< .001", paste0("= ", format.pval(or_tab$p.value, digits = 3)))`. Thus, each one-point increase in Neuroticism was associated with higher odds of selecting a higher C4 response under the proportional-odds model. Because C4 is reverse-keyed in the Conscientiousness scale, higher C4 responses indicate lower Conscientiousness.
+
+The proportional-odds test provided evidence against the shared-slope assumption, χ²(`r nt_df`) = `r round(nt_lrt, 2)`, *p* = `r format.pval(nt_p, digits = 3)`. The threshold-specific model therefore provides a more flexible description of the association. The predicted probability of responding "Slightly accurate or higher" under the proportional-odds model was `r round(prob_tab$Prob[1], 3)` at a Neuroticism score of `r prob_tab$Neuroticism[1]` and `r round(prob_tab$Prob[4], 3)` at a score of `r prob_tab$Neuroticism[4]`. These probabilities are illustrative because the proportional-odds assumption was not supported.
+
+## Answers to the assignment questions
+
+### Question 1: Describe your outcome and predictor.
+
+The outcome variable was C4 ("Do things in a half-way manner"), an ordinal item measuring Conscientiousness, with six ordered response categories ranging from "Very inaccurate" to "Very accurate." The predictor was Neuroticism, calculated as the mean score across the five Neuroticism items (N1–N5). Higher C4 responses indicate greater agreement with the statement and, because C4 is reverse-keyed in the Conscientiousness scale, reflect lower Conscientiousness.
+
+### Question 2: The N analysed, and whether any categories were sparse or collapsed.
+
+```{r}
+#| label: sample-and-category-counts
+
+nrow(data)
+table(data$C4)
+```
+
+The analysis included `r nrow(data)` complete observations. The six response categories were retained as ordered categories; no categories were collapsed. The least frequent category contained `r min(c4_counts$n)` responses (`r round(100 * min(c4_counts$p), 2)`% of the sample). It was less frequent than the other categories but was not empty.
+
+### Question 3: The LRT comparing M0 and M1 (χ², df, p) and the ΔAIC.
+
+```{r}
+#| label: lrt-aic-answer
+
+lr_stat <- lrt$LR.stat[2]
+lr_df <- lrt$df[2]
+lr_p <- lrt$`Pr(>Chisq)`[2]
+delta_aic <- AIC(one_pred) - AIC(null)
+
+tibble(
+  Chi_square = lr_stat,
+  df = lr_df,
+  p_value = lr_p,
+  Delta_AIC = delta_aic
+)
+```
+
+The model including Neuroticism `r ifelse(lr_p < .05, "significantly improved", "did not significantly improve")` model fit compared with the null model, χ²(`r lr_df`) = `r round(lr_stat, 2)`, *p* = `r format.pval(lr_p, digits = 3)`. The ΔAIC (AIC for the Neuroticism model minus AIC for the null model) was `r round(delta_aic, 2)`. The negative ΔAIC indicates that the Neuroticism model had a lower AIC and was preferred over the null model.
+
+### Question 4: The cumulative odds ratio, 95% CI, and p-value, with a plain-language interpretation of its direction.
+
+```{r}
+#| label: odds-ratio-answer
+
+or_tab
+```
+
+The cumulative odds ratio was OR = `r round(or_tab$estimate, 3)`, 95% CI [`r round(or_tab$conf.low, 3)`, `r round(or_tab$conf.high, 3)`], *p* = `r format.pval(or_tab$p.value, digits = 3)`. Each one-point increase in Neuroticism was associated with a `r abs(round(100 * (or_tab$estimate - 1), 1))`% `r ifelse(or_tab$estimate > 1, "increase", "decrease")` in the cumulative odds of selecting a higher C4 response. Higher C4 responses indicate greater agreement with doing things in a half-way manner and therefore lower Conscientiousness.
+
+### Question 5: The proportional odds test (χ², df, p), and whether a partial proportional odds model was needed.
+
+```{r}
+#| label: proportional-odds-answer
+
+nt
+```
+
+The proportional-odds test gave χ²(`r nt_df`) = `r round(nt_lrt, 2)`, *p* = `r format.pval(nt_p, digits = 3)`. Because the test `r ifelse(nt_p < .05, "was statistically significant, there is evidence that the proportional-odds assumption is violated. I therefore fitted the nominal-effects model with threshold-specific Neuroticism effects.", "was not statistically significant, the proportional-odds assumption was not rejected and the test did not indicate a need for a partial proportional-odds model.")`

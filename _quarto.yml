@@ -1,0 +1,23 @@
+project:
+  type: website
+  output-dir: docs
+
+website:
+  title: "Lab 6 - Ordinal Logistic Regression"
+  navbar:
+    left:
+      - text: "Home"
+        href: index.html
+
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    code-fold: false
+    embed-resources: true
+    html-math-method: katex
+
+execute:
+  warning: false
+  message: false

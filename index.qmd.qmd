@@ -1,0 +1,78 @@
+---
+title: "Ordinal Logistic Regression with the Big Five"
+subtitle: "Does Agreeableness predict getting angry easily?"
+format:
+  html:
+    toc: true
+    code-fold: false
+    embed-resources: true
+    html-math-method: katex
+execute:
+  echo: true
+  warning: false
+  message: false
+  fig-width: 8
+  fig-height: 4.4
+---
+
+# Introduction
+
+This report examines whether Agreeableness predicts responses to the personality item "Get angry easily" using ordinal logistic regression. The analysis uses the Big Five Inventory (BFI) dataset.
+
+# Data Preparation
+
+## Load packages
+
+```{r}
+library(tidyverse)
+library(psych)
+library(ordinal)
+library(readxl)
+library(ggeffects)
+library(broom)
+library(gt)
+
+```
+
+## Import the dataset
+
+```{r}
+data <- read_excel("./bfi.xlsx")
+
+data[, 2:26] <- lapply(data[, 2:26], as.integer)
+```
+
+## Convert personality item responses to numeric values
+
+```{r}
+bfi <- bfi |>
+  dplyr::select(-dplyr::any_of("...1"))
+
+data <- data %>%
+  mutate(across(A1:O5, as.numeric))
+
+str(data)
+```
+
+# Score the Big Five personality dimensions
+
+```{r}
+keys <- list(
+  Agreeableness = c("-A1", "A2", "A3", "A4", "A5"),
+  Conscientiousness = c("C1", "C2", "C3", "-C4", "-C5"),
+  Extraversion = c("-E1", "-E2", "E3", "E4", "E5"),
+  Neuroticism = c("N1", "N2", "N3", "N4", "N5"),
+  Openness = c("O1", "-O2", "O3", "O4", "-O5")
+)
+
+scores <- scoreItems(
+  keys,
+  data,
+  totals = FALSE,
+  min = 1,
+  max = 6
+)
+
+# Inspect the scoring results
+head(scores$scores)
+```
